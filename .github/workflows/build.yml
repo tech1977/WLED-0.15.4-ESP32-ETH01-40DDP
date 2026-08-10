@@ -1,4 +1,4 @@
-name: Build WLED 0.15.4 ESP32-ETH01 40 DDP 40 SEG Persistent v3
+name: Build WLED 0.15.4 ESP32-ETH01 40 DDP 40 SEG Persistent Tech1977
 
 on:
   workflow_dispatch:
@@ -249,6 +249,25 @@ jobs:
           print(" - 40 segments")
           print(" - MAX_SEGMENT_DATA = 51200 bytes max")
           print(" - WT32-ETH01 Ethernet default")
+# 9) Custom visible release label.
+# Replace the stock release codename shown in the UI with a custom label.
+replaced = 0
+for fp in Path("wled00").rglob("*"):
+    if not fp.is_file():
+        continue
+    try:
+        txt = fp.read_text(encoding="utf-8")
+    except Exception:
+        continue
+    if "Kösen" in txt:
+        txt = txt.replace("Kösen", "test ddp Tech1977")
+        fp.write_text(txt, encoding="utf-8")
+        replaced += 1
+
+if replaced < 1:
+    raise SystemExit("Release label 'Kösen' not found")
+
+print(" - custom release label: test ddp Tech1977")
           PY
 
       - name: Verify patch
@@ -275,7 +294,7 @@ jobs:
           echo "=== LED settings output ID map ==="
           grep -n -A6 "function chrID" wled00/data/settings_leds.htm
           grep -q "String.fromCharCode(61+x)" wled00/data/settings_leds.htm
-          grep -q "char('a' + s - 36)" wled00/xml.cpp
+          grep -R -n "test ddp Tech1977" wled00 | head -n 5
 
           echo "=== Ethernet ==="
           sed -n '/\[env:esp32_eth\]/,/^\[/p' platformio.ini | head -n 30
@@ -298,15 +317,15 @@ jobs:
 
           mkdir -p dist
           cp .pio/build/esp32_eth/firmware.bin \
-            dist/WLED_0.15.4_ESP32-ETH01_40DDP_40SEG_PERSIST_v3.bin
+            dist/WLED_0.15.4_ESP32-ETH01_40DDP_40SEG_PERSIST_Tech1977.bin
 
           sha256sum \
-            dist/WLED_0.15.4_ESP32-ETH01_40DDP_40SEG_PERSIST_v3.bin \
-            > dist/WLED_0.15.4_ESP32-ETH01_40DDP_40SEG_PERSIST_v3.bin.sha256
+            dist/WLED_0.15.4_ESP32-ETH01_40DDP_40SEG_PERSIST_Tech1977.bin \
+            > dist/WLED_0.15.4_ESP32-ETH01_40DDP_40SEG_PERSIST_Tech1977.bin.sha256
 
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v7
         with:
-          name: WLED_0.15.4_ESP32-ETH01_40DDP_40SEG_PERSIST_v3
+          name: WLED_0.15.4_ESP32-ETH01_40DDP_40SEG_PERSIST_Tech1977
           path: dist/*
           if-no-files-found: error
