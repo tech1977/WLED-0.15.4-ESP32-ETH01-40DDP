@@ -1,4 +1,4 @@
-name: Diagnose WLED 0.15.4 backport PR4529 v2
+name: Build WLED 0.15.4 ESP32-ETH01 40 DDP 40 SEG Persistent
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 jobs:
-  diagnose:
+  build:
     runs-on: ubuntu-latest
 
     steps:
@@ -16,144 +16,299 @@ jobs:
         with:
           repository: wled/WLED
           ref: v0.15.4
-          fetch-depth: 0
 
-      - name: Reconstruct official PR 4529 patch
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          package-manager-cache: false
+
+      - name: Apply 40 DDP / 40 segment compatibility patch
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          def read(path):
+              return Path(path).read_text(encoding="utf-8")
+
+          def write(path, text):
+              Path(path).write_text(text, encoding="utf-8")
+
+          # 1) Classic ESP32 UI capacity: 19 physical + 21 virtual = 40.
+          p = "wled00/const.h"
+          s = read(p)
+
+          marker = "#define WLED_MAX_BUSSES 19"
+          start = s.find(marker)
+          if start < 0:
+              raise SystemExit("Classic ESP32 WLED_MAX_BUSSES 19 block not found")
+
+          target = "#define WLED_MIN_VIRTUAL_BUSSES 6"
+          pos = s.find(target, start)
+          if pos < 0 or (pos - start) > 900:
+              raise SystemExit("Classic ESP32 WLED_MIN_VIRTUAL_BUSSES 6 not found")
+
+          s = s[:pos] + "#define WLED_MIN_VIRTUAL_BUSSES 21" + s[pos + len(target):]
+          write(p, s)
+
+          # 2) 40 segments, keeping WLED's stock proportional effect-data formula.
+          p = "wled00/FX.h"
+          s = read(p)
+
+          s, n = re.subn(
+              r'(?m)^#define\s+MAX_NUM_SEGMENTS\s+32\s*$',
+              '#define MAX_NUM_SEGMENTS  40',
+              s,
+              count=1
+          )
+          if n != 1:
+              raise SystemExit("MAX_NUM_SEGMENTS 32 not found exactly once")
+
+          if not re.search(
+              r'(?m)^#define\s+MAX_SEGMENT_DATA\s+\(MAX_NUM_SEGMENTS\*1280\)\s*$',
+              s
+          ):
+              raise SystemExit("Original MAX_SEGMENT_DATA formula not found")
+
+          write(p, s)
+
+          # 3) Config loader: only physical buses count against WLED_MAX_BUSSES.
+          p = "wled00/cfg.cpp"
+          s = read(p)
+
+          old = "if (s >= WLED_MAX_BUSSES+WLED_MIN_VIRTUAL_BUSSES) break;"
+          if old not in s:
+              raise SystemExit("cfg.cpp old total bus limit not found")
+          s = s.replace(old, "if (s >= WLED_MAX_BUSSES) break;", 1)
+
+          old_block = (
+              "      doInitBusses = true;  // finalization done in beginStrip()\n"
+              "      s++;\n"
+              "    }\n"
+              "  }\n"
+              '  if (hw_led["rev"]) BusManager::getBus(0)->setReversed(true);'
+          )
+          new_block = (
+              "      doInitBusses = true;  // finalization done in beginStrip()\n"
+              "      if (!Bus::isVirtual(ledType)) s++; // only physical buses count against WLED_MAX_BUSSES\n"
+              "    }\n"
+              "  }\n"
+              '  if (hw_led["rev"] && BusManager::getNumBusses()) BusManager::getBus(0)->setReversed(true);'
+          )
+
+          if old_block not in s:
+              raise SystemExit("cfg.cpp bus increment block not found")
+          s = s.replace(old_block, new_block, 1)
+          write(p, s)
+
+          # 4) LED settings POST parser.
+          # IDs 0..9, A..Z, then a..d for buses 36..39.
+          p = "wled00/set.cpp"
+          s = read(p)
+
+          loop_old = "for (int s = 0; s < WLED_MAX_BUSSES+WLED_MIN_VIRTUAL_BUSSES; s++) {"
+          loop_pos = s.find(loop_old)
+          if loop_pos < 0:
+              raise SystemExit("set.cpp LED bus loop not found")
+
+          block_end = s.find("    //doInitBusses = busesChanged;", loop_pos)
+          if block_end < 0:
+              raise SystemExit("set.cpp LED bus loop end not found")
+
+          block = s[loop_pos:block_end]
+          block = block.replace(
+              loop_old,
+              "for (int s = 0; s < 40; s++) {\n"
+              "      const char busId = (s < 10) ? char('0' + s) : ((s < 36) ? char('A' + s - 10) : char('a' + s - 36));",
+              1
+          )
+
+          block, n = re.subn(
+              r"(?m)^\s*int offset = s < 10 \? (?:48|'0') : (?:55|'A' - 10);\s*\n",
+              '',
+              block,
+              count=1
+          )
+          if n != 1:
+              raise SystemExit("set.cpp old bus ID offset line not found")
+
+          block = block.replace("offset+s", "busId")
+          s = s[:loop_pos] + block + s[block_end:]
+          write(p, s)
+
+          # 5) LED settings JS generated by firmware: same ID mapping.
+          p = "wled00/xml.cpp"
+          s = read(p)
+
+          loop_marker = "for (int s = 0; s < BusManager::getNumBusses(); s++) {"
+          loop_pos = s.find(loop_marker)
+          if loop_pos < 0:
+              raise SystemExit("xml.cpp LED bus loop not found")
+
+          block_end = s.find("    const ColorOrderMap& com =", loop_pos)
+          if block_end < 0:
+              raise SystemExit("xml.cpp LED bus loop end not found")
+
+          block = s[loop_pos:block_end]
+          block = block.replace(
+              loop_marker,
+              "for (int s = 0; s < BusManager::getNumBusses(); s++) {\n"
+              "      const char busId = (s < 10) ? char('0' + s) : ((s < 36) ? char('A' + s - 10) : char('a' + s - 36));",
+              1
+          )
+
+          block, n = re.subn(
+              r"(?m)^\s*int offset = s < 10 \? (?:48|'0') : (?:55|'A' - 10);\s*\n",
+              '',
+              block,
+              count=1
+          )
+          if n != 1:
+              raise SystemExit("xml.cpp old bus ID offset line not found")
+
+          block = block.replace("offset+s", "busId")
+          s = s[:loop_pos] + block + s[block_end:]
+          write(p, s)
+
+          # 6) Browser LED settings page: same 40-output ID mapping.
+          p = "wled00/data/settings_leds.htm"
+          s = read(p)
+
+          s, n = re.subn(
+              r'function\s+chrID\(x\)\s*\{\s*return\s+String\.fromCharCode\(\(x<10\?48:55\)\+x\);\s*\}',
+              (
+                  "function chrID(x)  {\n"
+                  "            if (x < 10) return String.fromCharCode(48+x);\n"
+                  "            if (x < 36) return String.fromCharCode(55+x);\n"
+                  "            return String.fromCharCode(61+x);\n"
+                  "        }"
+              ),
+              s,
+              count=1
+          )
+          if n != 1:
+              raise SystemExit("settings_leds.htm chrID() not found")
+
+          s = s.replace(
+              "for (var i=0; i<10; i++) addLEDs(-1);",
+              "for (var i=0; i<40; i++) addLEDs(-1);",
+              1
+          )
+
+          write(p, s)
+
+          # 7) Auto-segment safety: never write past MAX_NUM_SEGMENTS arrays.
+          p = "wled00/FX_fcn.cpp"
+          s = read(p)
+
+          func_pos = s.find("void WS2812FX::makeAutoSegments(bool forceReset)")
+          if func_pos < 0:
+              raise SystemExit("makeAutoSegments() not found")
+
+          loop = "for (size_t i = s; i < BusManager::getNumBusses(); i++) {"
+          loop_pos = s.find(loop, func_pos)
+          if loop_pos < 0:
+              raise SystemExit("makeAutoSegments bus loop not found")
+
+          replacement = loop + "\n      if (s >= MAX_NUM_SEGMENTS) break;"
+          s = s[:loop_pos] + s[loop_pos:].replace(loop, replacement, 1)
+          write(p, s)
+
+          # 8) WT32-ETH01 default Ethernet board type.
+          p = "platformio.ini"
+          s = read(p)
+
+          env_start = s.find("[env:esp32_eth]")
+          if env_start < 0:
+              raise SystemExit("[env:esp32_eth] not found")
+
+          env_end = s.find("\n[", env_start + 1)
+          if env_end < 0:
+              env_end = len(s)
+
+          section = s[env_start:env_end]
+
+          if "-D WLED_ETH_DEFAULT=1" not in section:
+              flag = "-D WLED_USE_ETHERNET"
+              if flag not in section:
+                  raise SystemExit("WLED_USE_ETHERNET flag not found in esp32_eth")
+              section = section.replace(flag, flag + " -D WLED_ETH_DEFAULT=1", 1)
+
+          s = s[:env_start] + section + s[env_end:]
+          write(p, s)
+
+          print("PATCH OK")
+          print(" - 40 LED output form slots")
+          print(" - output IDs 36..39 = a,b,c,d")
+          print(" - virtual DDP buses do not count against physical bus limit")
+          print(" - 40 segments")
+          print(" - MAX_SEGMENT_DATA = 51200 bytes max")
+          print(" - WT32-ETH01 Ethernet default")
+          PY
+
+      - name: Verify patch
         shell: bash
         run: |
           set -euxo pipefail
 
-          git fetch --no-tags origin \
-            refs/heads/main:refs/remotes/origin/main
+          echo "=== Classic ESP32 virtual slots ==="
+          grep -n -A5 -B2 "WLED_MAX_BUSSES 19" wled00/const.h
 
-          git fetch --no-tags origin \
-            refs/pull/4529/head:refs/remotes/origin/pr4529
+          echo "=== Segment limits ==="
+          grep -n -E "MAX_NUM_SEGMENTS|MAX_SEGMENT_DATA" wled00/FX.h | head -n 10
+          grep -qE '^#define[[:space:]]+MAX_NUM_SEGMENTS[[:space:]]+40[[:space:]]*$' wled00/FX.h
+          grep -qE '^#define[[:space:]]+MAX_SEGMENT_DATA[[:space:]]+\(MAX_NUM_SEGMENTS\*1280\)[[:space:]]*$' wled00/FX.h
 
-          PATCH=/tmp/wled-pr4529.diff
-          : > "$PATCH"
+          echo "=== Config virtual-bus loader ==="
+          grep -n -A45 "JsonArray ins = hw_led" wled00/cfg.cpp | head -n 60
+          grep -q 'if (!Bus::isVirtual(ledType)) s++;' wled00/cfg.cpp
 
-          # Old/merged PRs may no longer expose refs/pull/<N>/merge.
-          # Try it, but do not fail if it does not exist.
-          set +e
-          git fetch --no-tags origin \
-            refs/pull/4529/merge:refs/remotes/origin/pr4529-merge
-          MERGE_FETCH_RC=$?
-          set -e
+          echo "=== 40-output POST parser ==="
+          grep -n -A4 "for (int s = 0; s < 40; s++)" wled00/set.cpp
+          grep -q "char('a' + s - 36)" wled00/set.cpp
 
-          if [ "$MERGE_FETCH_RC" -eq 0 ]; then
-            MERGE_REF=refs/remotes/origin/pr4529-merge
-            PARENT_COUNT="$(git rev-list --parents -n 1 "$MERGE_REF" | awk '{print NF-1}')"
+          echo "=== LED settings output ID map ==="
+          grep -n -A6 "function chrID" wled00/data/settings_leds.htm
+          grep -q "String.fromCharCode(61+x)" wled00/data/settings_leds.htm
+          grep -q "char('a' + s - 36)" wled00/xml.cpp
 
-            if [ "$PARENT_COUNT" -ge 2 ]; then
-              BASE="$(git rev-parse "$MERGE_REF^1")"
-              git diff --binary "$BASE" "$MERGE_REF" > "$PATCH"
-            fi
-          fi
+          echo "=== Ethernet ==="
+          sed -n '/\[env:esp32_eth\]/,/^\[/p' platformio.ini | head -n 30
+          sed -n '/\[env:esp32_eth\]/,/^\[/p' platformio.ini | grep -q -- "-D WLED_ETH_DEFAULT=1"
 
-          # Fallback: find the merged/squashed PR commit in current main.
-          if [ ! -s "$PATCH" ]; then
-            PR_COMMIT="$(git log refs/remotes/origin/main \
-              --format='%H' --grep='#4529' -n 1 || true)"
+      - name: Install PlatformIO
+        run: python -m pip install --upgrade platformio
 
-            if [ -z "$PR_COMMIT" ]; then
-              PR_COMMIT="$(git log refs/remotes/origin/main \
-                --format='%H' --regexp-ignore-case \
-                --grep='unlimited.*buses' -n 1 || true)"
-            fi
+      - name: Install web UI dependencies
+        run: npm ci
 
-            if [ -z "$PR_COMMIT" ]; then
-              echo "ERROR: unable to identify PR #4529 merge/squash commit."
-              exit 1
-            fi
+      - name: Build esp32_eth
+        run: pio run -e esp32_eth
 
-            echo "PR 4529 commit in main: $PR_COMMIT"
-            echo "Subject: $(git show -s --format='%s' "$PR_COMMIT")"
-
-            PARENT_COUNT="$(git rev-list --parents -n 1 "$PR_COMMIT" | awk '{print NF-1}')"
-
-            if [ "$PARENT_COUNT" -ge 2 ]; then
-              BASE="$(git rev-parse "$PR_COMMIT^1")"
-            else
-              BASE="$(git rev-parse "$PR_COMMIT^")"
-            fi
-
-            git diff --binary "$BASE" "$PR_COMMIT" > "$PATCH"
-          fi
-
-          test -s "$PATCH"
-
-          echo "=== PR 4529 patch stat ==="
-          git apply --stat "$PATCH"
-
-          mkdir -p /tmp/diag
-          cp "$PATCH" /tmp/diag/WLED_PR4529_full.diff
-
-      - name: Apply compatible hunks and collect rejects
+      - name: Prepare firmware
         shell: bash
         run: |
-          set +e
+          set -euxo pipefail
+          test -f .pio/build/esp32_eth/firmware.bin
 
-          # Apply everything that cleanly matches v0.15.4 and write only
-          # incompatible hunks to *.rej files.
-          git apply --reject --whitespace=fix /tmp/wled-pr4529.diff
-          APPLY_RC=$?
+          mkdir -p dist
+          cp .pio/build/esp32_eth/firmware.bin \
+            dist/WLED_0.15.4_ESP32-ETH01_40DDP_40SEG_PERSIST.bin
 
-          echo "git apply return code: $APPLY_RC"
+          sha256sum \
+            dist/WLED_0.15.4_ESP32-ETH01_40DDP_40SEG_PERSIST.bin \
+            > dist/WLED_0.15.4_ESP32-ETH01_40DDP_40SEG_PERSIST.bin.sha256
 
-          mkdir -p /tmp/diag/rejects
-          mkdir -p /tmp/diag/sources
-
-          find wled00 -type f -name '*.rej' -print | sort | while read f; do
-            mkdir -p "/tmp/diag/rejects/$(dirname "$f")"
-            cp "$f" "/tmp/diag/rejects/$f"
-          done
-
-          for f in \
-            wled00/FX_fcn.cpp \
-            wled00/bus_manager.cpp \
-            wled00/bus_manager.h \
-            wled00/cfg.cpp \
-            wled00/const.h \
-            wled00/data/settings_leds.htm \
-            wled00/set.cpp \
-            wled00/wled.h \
-            wled00/xml.cpp
-          do
-            if [ -f "$f" ]; then
-              mkdir -p "/tmp/diag/sources/$(dirname "$f")"
-              cp "$f" "/tmp/diag/sources/$f"
-            fi
-            if [ -f "$f.orig" ]; then
-              mkdir -p "/tmp/diag/sources/$(dirname "$f")"
-              cp "$f.orig" "/tmp/diag/sources/$f.orig"
-            fi
-          done
-
-          {
-            echo "=== APPLY RETURN CODE ==="
-            echo "$APPLY_RC"
-            echo
-            echo "=== STATUS ==="
-            git status --short
-            echo
-            echo "=== REJECT FILES ==="
-            find wled00 -type f -name '*.rej' -print | sort
-            echo
-            echo "=== REJECT CONTENTS ==="
-            while read f; do
-              [ -z "$f" ] && continue
-              echo
-              echo "######## $f ########"
-              cat "$f"
-            done < <(find wled00 -type f -name '*.rej' -print | sort)
-          } | tee /tmp/diag/rejects.txt
-
-          # Diagnostic run must continue so the artifact is always uploaded.
-          exit 0
-
-      - name: Upload diagnostic artifact
+      - name: Upload firmware artifact
         uses: actions/upload-artifact@v7
         with:
-          name: PR4529_v0154_backport_diagnostics_v2
-          path: /tmp/diag/**
+          name: WLED_0.15.4_ESP32-ETH01_40DDP_40SEG_PERSIST
+          path: dist/*
           if-no-files-found: error
