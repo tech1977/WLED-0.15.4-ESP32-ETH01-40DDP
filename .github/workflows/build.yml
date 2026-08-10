@@ -1,4 +1,4 @@
-name: Build WLED 0.15.4 ETH01 - PR4529 - 40 DDP - 40 Segments
+name: Diagnose WLED 0.15.4 backport PR4529
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  diagnose:
     runs-on: ubuntu-latest
 
     steps:
@@ -18,228 +18,98 @@ jobs:
           ref: v0.15.4
           fetch-depth: 0
 
-      - name: Setup Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.11'
-
-      - name: Setup Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: '20'
-          package-manager-cache: false
-
-      - name: Backport official WLED PR 4529 - Unlimited buses
+      - name: Fetch PR 4529 and reconstruct patch
         shell: bash
         run: |
           set -euxo pipefail
-
-          # Fetch current main and the PR refs.
-          git fetch --no-tags origin \
-            refs/heads/main:refs/remotes/origin/main
 
           git fetch --no-tags origin \
             refs/pull/4529/head:refs/remotes/origin/pr4529
 
-          # IMPORTANT:
-          # The PR head is already an ancestor of today's main, so using
-          # merge-base(main, PR_HEAD) gives PR_HEAD itself and an empty diff.
-          # Prefer the PR synthetic merge ref, which preserves the target-side
-          # parent needed to reconstruct exactly what PR #4529 introduced.
-          HAVE_MERGE_REF=0
-          if git fetch --no-tags origin \
-              refs/pull/4529/merge:refs/remotes/origin/pr4529-merge; then
-            HAVE_MERGE_REF=1
-          fi
+          git fetch --no-tags origin \
+            refs/pull/4529/merge:refs/remotes/origin/pr4529-merge
 
-          PATCH=/tmp/wled-pr4529.diff
-          : > "$PATCH"
+          MERGE_REF=refs/remotes/origin/pr4529-merge
+          BASE="$(git rev-parse "$MERGE_REF^1")"
 
-          if [ "$HAVE_MERGE_REF" -eq 1 ]; then
-            MERGE_REF=refs/remotes/origin/pr4529-merge
-            PARENT_COUNT="$(git rev-list --parents -n 1 "$MERGE_REF" | awk '{print NF-1}')"
+          echo "PR head:  $(git rev-parse refs/remotes/origin/pr4529)"
+          echo "PR merge: $(git rev-parse "$MERGE_REF")"
+          echo "PR base:  $BASE"
 
-            echo "PR merge ref: $(git rev-parse "$MERGE_REF")"
-            echo "Merge parent count: $PARENT_COUNT"
+          git diff --binary "$BASE" "$MERGE_REF" > /tmp/wled-pr4529.diff
+          test -s /tmp/wled-pr4529.diff
 
-            if [ "$PARENT_COUNT" -ge 2 ]; then
-              BASE="$(git rev-parse "$MERGE_REF^1")"
-              echo "PR target-side parent: $BASE"
+          echo "=== PR 4529 patch stat ==="
+          git apply --stat /tmp/wled-pr4529.diff
 
-              # Net changes introduced by the PR merge, including any merge
-              # conflict resolution that GitHub recorded.
-              git diff --binary "$BASE" "$MERGE_REF" > "$PATCH"
-            fi
-          fi
-
-          # Fallback for repositories where the PR merge ref is unavailable:
-          # locate the merged/squashed commit in main by PR number or title.
-          if [ ! -s "$PATCH" ]; then
-            echo "Merge-ref method unavailable/empty; trying main-history fallback."
-
-            PR_COMMIT="$(git log refs/remotes/origin/main \
-              --format='%H' --grep='#4529' -n 1 || true)"
-
-            if [ -z "$PR_COMMIT" ]; then
-              PR_COMMIT="$(git log refs/remotes/origin/main \
-                --format='%H' --regexp-ignore-case \
-                --grep='unlimited.*buses' -n 1 || true)"
-            fi
-
-            if [ -z "$PR_COMMIT" ]; then
-              echo "ERROR: unable to identify PR #4529 merge/squash commit."
-              exit 1
-            fi
-
-            echo "PR commit found in main: $PR_COMMIT"
-            echo "Subject: $(git show -s --format='%s' "$PR_COMMIT")"
-
-            PARENT_COUNT="$(git rev-list --parents -n 1 "$PR_COMMIT" | awk '{print NF-1}')"
-
-            if [ "$PARENT_COUNT" -ge 2 ]; then
-              BASE="$(git rev-parse "$PR_COMMIT^1")"
-            else
-              BASE="$(git rev-parse "$PR_COMMIT^")"
-            fi
-
-            git diff --binary "$BASE" "$PR_COMMIT" > "$PATCH"
-          fi
-
-          test -s "$PATCH"
-
-          echo "=== PR 4529 patch files ==="
-          git apply --stat "$PATCH"
-          git apply --numstat "$PATCH"
-
-          # Apply onto the checked-out v0.15.4 tree.
-          # --3way uses the blob IDs in the generated Git diff when possible.
-          git apply --3way "$PATCH"
-
-          echo "=== PR 4529 backport applied to v0.15.4 ==="
-          git status --short
-
-      - name: Patch 40 segments and WT32-ETH01 default
+      - name: Apply what can be applied and collect rejects
         shell: bash
         run: |
-          python - <<'PY'
-          from pathlib import Path
-          import re
+          set +e
 
-          # ------------------------------------------------------------
-          # 1) 40 segments.
-          # Keep WLED's stock effect-data ratio:
-          # 40 * 1280 = 51200 bytes maximum.
-          # ------------------------------------------------------------
-          p = Path("wled00/FX.h")
-          s = p.read_text(encoding="utf-8")
+          # --reject applies compatible hunks and writes only incompatible
+          # hunks to *.rej files. We intentionally continue after failure.
+          git apply --reject --whitespace=fix /tmp/wled-pr4529.diff
+          APPLY_RC=$?
 
-          if re.search(r'(?m)^#define\s+MAX_NUM_SEGMENTS\s+32\s*$', s):
-              s = re.sub(
-                  r'(?m)^#define\s+MAX_NUM_SEGMENTS\s+32\s*$',
-                  '#define MAX_NUM_SEGMENTS  40',
-                  s,
-                  count=1
-              )
-          elif not re.search(r'(?m)^#define\s+MAX_NUM_SEGMENTS\s+40\s*$', s):
-              raise SystemExit("MAX_NUM_SEGMENTS 32/40 not found")
+          echo "git apply return code: $APPLY_RC"
 
-          if re.search(r'(?m)^#define\s+MAX_SEGMENT_DATA\s+\(40\*1024\)\s*$', s):
-              s = re.sub(
-                  r'(?m)^#define\s+MAX_SEGMENT_DATA\s+\(40\*1024\)\s*$',
-                  '#define MAX_SEGMENT_DATA  (MAX_NUM_SEGMENTS*1280)',
-                  s,
-                  count=1
-              )
-          elif not re.search(
-              r'(?m)^#define\s+MAX_SEGMENT_DATA\s+\(MAX_NUM_SEGMENTS\*1280\)\s*$',
-              s
-          ):
-              raise SystemExit("MAX_SEGMENT_DATA formula not found")
+          mkdir -p /tmp/diag/rejects
+          mkdir -p /tmp/diag/sources
 
-          p.write_text(s, encoding="utf-8")
+          cp /tmp/wled-pr4529.diff /tmp/diag/WLED_PR4529_full.diff
 
-          # ------------------------------------------------------------
-          # 2) WT32-ETH01 as default Ethernet profile.
-          # WLED_ETH_WT32_ETH01 == 1.
-          # ------------------------------------------------------------
-          p = Path("platformio.ini")
-          s = p.read_text(encoding="utf-8")
+          # Collect all reject files.
+          find wled00 -type f -name '*.rej' -print | sort | while read f; do
+            mkdir -p "/tmp/diag/rejects/$(dirname "$f")"
+            cp "$f" "/tmp/diag/rejects/$f"
+          done
 
-          env_start = s.find("[env:esp32_eth]")
-          if env_start < 0:
-              raise SystemExit("[env:esp32_eth] not found")
+          # Collect the affected v0.15.4 files AFTER non-conflicting hunks
+          # have been applied, plus .orig where generated.
+          for f in \
+            wled00/FX_fcn.cpp \
+            wled00/bus_manager.cpp \
+            wled00/bus_manager.h \
+            wled00/cfg.cpp \
+            wled00/const.h \
+            wled00/data/settings_leds.htm \
+            wled00/set.cpp \
+            wled00/wled.h \
+            wled00/xml.cpp
+          do
+            if [ -f "$f" ]; then
+              mkdir -p "/tmp/diag/sources/$(dirname "$f")"
+              cp "$f" "/tmp/diag/sources/$f"
+            fi
+            if [ -f "$f.orig" ]; then
+              mkdir -p "/tmp/diag/sources/$(dirname "$f")"
+              cp "$f.orig" "/tmp/diag/sources/$f.orig"
+            fi
+          done
 
-          env_end = s.find("\n[", env_start + 1)
-          if env_end < 0:
-              env_end = len(s)
+          {
+            echo "=== STATUS ==="
+            git status --short
+            echo
+            echo "=== REJECT FILES ==="
+            find wled00 -type f -name '*.rej' -print | sort
+            echo
+            echo "=== REJECT CONTENTS ==="
+            while read f; do
+              [ -z "$f" ] && continue
+              echo
+              echo "######## $f ########"
+              cat "$f"
+            done < <(find wled00 -type f -name '*.rej' -print | sort)
+          } | tee /tmp/diag/rejects.txt
 
-          section = s[env_start:env_end]
+          # Always succeed so the diagnostic artifact is uploaded.
+          exit 0
 
-          if "-D WLED_ETH_DEFAULT=1" not in section:
-              flag = "-D WLED_USE_ETHERNET"
-              if flag not in section:
-                  raise SystemExit("WLED_USE_ETHERNET flag not found in esp32_eth")
-              section = section.replace(
-                  flag,
-                  flag + " -D WLED_ETH_DEFAULT=1",
-                  1
-              )
-
-          s = s[:env_start] + section + s[env_end:]
-          p.write_text(s, encoding="utf-8")
-
-          print("OK: PR 4529 backport present")
-          print("OK: MAX_NUM_SEGMENTS = 40")
-          print("OK: MAX_SEGMENT_DATA = 51200 bytes max")
-          print("OK: WT32-ETH01 default Ethernet type = 1")
-          PY
-
-      - name: Verify custom build
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          echo "=== Segment limits ==="
-          grep -n -E "MAX_NUM_SEGMENTS|MAX_SEGMENT_DATA" wled00/FX.h | head -n 10
-          grep -qE '^#define[[:space:]]+MAX_NUM_SEGMENTS[[:space:]]+40[[:space:]]*$' wled00/FX.h
-          grep -qE '^#define[[:space:]]+MAX_SEGMENT_DATA[[:space:]]+\(MAX_NUM_SEGMENTS\*1280\)[[:space:]]*$' wled00/FX.h
-
-          echo "=== Ethernet env ==="
-          sed -n '/\[env:esp32_eth\]/,/^\[/p' platformio.ini | head -n 30
-          sed -n '/\[env:esp32_eth\]/,/^\[/p' platformio.ini | grep -q -- "-D WLED_ETH_DEFAULT=1"
-
-          echo "=== Backported/custom files ==="
-          git status --short
-
-      - name: Install PlatformIO
-        run: python -m pip install --upgrade platformio
-
-      - name: Install web UI dependencies
-        run: npm ci
-
-      - name: Build esp32_eth
-        run: pio run -e esp32_eth
-
-      - name: Prepare firmware
-        shell: bash
-        run: |
-          set -euxo pipefail
-          test -f .pio/build/esp32_eth/firmware.bin
-
-          mkdir -p dist
-          cp .pio/build/esp32_eth/firmware.bin \
-            dist/WLED_0.15.4_ESP32-ETH01_PR4529_40DDP_40SEG.bin
-
-          sha256sum \
-            dist/WLED_0.15.4_ESP32-ETH01_PR4529_40DDP_40SEG.bin \
-            > dist/WLED_0.15.4_ESP32-ETH01_PR4529_40DDP_40SEG.bin.sha256
-
-          cp /tmp/wled-pr4529.diff \
-            dist/WLED_PR4529_unlimited-buses_backport.diff
-
-      - name: Upload firmware artifact
+      - name: Upload diagnostic artifact
         uses: actions/upload-artifact@v7
         with:
-          name: WLED_0.15.4_ESP32-ETH01_PR4529_40DDP_40SEG
-          path: dist/*
+          name: PR4529_v0154_backport_diagnostics
+          path: /tmp/diag/**
           if-no-files-found: error
