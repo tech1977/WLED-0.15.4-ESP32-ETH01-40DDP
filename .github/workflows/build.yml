@@ -6,22 +6,24 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout WLED 0.15.4
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: wled/WLED
           ref: v0.15.4
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: '20'
+          package-manager-cache: false
 
       - name: Patch 40 DDP slots and WT32-ETH01 default
         shell: bash
@@ -29,21 +31,75 @@ jobs:
           python - <<'PY'
           from pathlib import Path
 
+          # ------------------------------------------------------------
+          # 1) ESP32 classico:
+          #    WLED_MAX_BUSSES = 19
+          #    WLED_MIN_VIRTUAL_BUSSES = 21
+          #    Totale slot bus = 40
+          # ------------------------------------------------------------
           p = Path("wled00/const.h")
           s = p.read_text(encoding="utf-8")
-          old = "#define WLED_MIN_VIRTUAL_BUSSES 6"
-          if old not in s:
-              raise SystemExit("Expected WLED_MIN_VIRTUAL_BUSSES=6 not found")
-          p.write_text(s.replace(old, "#define WLED_MIN_VIRTUAL_BUSSES 21", 1), encoding="utf-8")
 
-          p = Path("wled00/wled.h")
+          marker = "#define WLED_MAX_BUSSES 19"
+          start = s.find(marker)
+          if start < 0:
+              raise SystemExit("Classic ESP32 WLED_MAX_BUSSES 19 block not found")
+
+          target = "#define WLED_MIN_VIRTUAL_BUSSES 6"
+          pos = s.find(target, start)
+
+          if pos < 0 or (pos - start) > 800:
+              raise SystemExit("Classic ESP32 WLED_MIN_VIRTUAL_BUSSES 6 not found")
+
+          replacement = "#define WLED_MIN_VIRTUAL_BUSSES 21"
+          s = s[:pos] + replacement + s[pos + len(target):]
+          p.write_text(s, encoding="utf-8")
+
+          # ------------------------------------------------------------
+          # 2) Ethernet WT32-ETH01 predefinita
+          #    WLED_ETH_WT32_ETH01 = 1
+          # ------------------------------------------------------------
+          p = Path("platformio.ini")
           s = p.read_text(encoding="utf-8")
-          old = "WLED_GLOBAL int ethernetType _INIT(WLED_ETH_NONE); // use none for ethernet board type if default not defined"
-          new = "WLED_GLOBAL int ethernetType _INIT(WLED_ETH_WT32_ETH01); // custom build: default WT32-ETH01"
-          if old not in s:
-              raise SystemExit("Expected Ethernet default not found")
-          p.write_text(s.replace(old, new, 1), encoding="utf-8")
+
+          env_start = s.find("[env:esp32_eth]")
+          if env_start < 0:
+              raise SystemExit("[env:esp32_eth] not found")
+
+          env_end = s.find("\n[", env_start + 1)
+          if env_end < 0:
+              env_end = len(s)
+
+          section = s[env_start:env_end]
+
+          flag = "-D WLED_USE_ETHERNET"
+          if flag not in section:
+              raise SystemExit("WLED_USE_ETHERNET flag not found in esp32_eth")
+
+          section = section.replace(
+              flag,
+              flag + " -D WLED_ETH_DEFAULT=1",
+              1
+          )
+
+          s = s[:env_start] + section + s[env_end:]
+          p.write_text(s, encoding="utf-8")
+
+          print("OK: classic ESP32 WLED_MIN_VIRTUAL_BUSSES = 21")
+          print("OK: WT32-ETH01 default Ethernet type = 1")
           PY
+
+      - name: Verify patch
+        shell: bash
+        run: |
+          echo "=== const.h ==="
+          grep -n -A4 -B2 "WLED_MAX_BUSSES 19" wled00/const.h
+
+          echo "=== esp32_eth ==="
+          sed -n '/\[env:esp32_eth\]/,/^\[/p' platformio.ini | head -n 20
+
+          grep -q "#define WLED_MIN_VIRTUAL_BUSSES 21" wled00/const.h
+          sed -n '/\[env:esp32_eth\]/,/^\[/p' platformio.ini | grep -q -- "-D WLED_ETH_DEFAULT=1"
 
       - name: Install PlatformIO
         run: python -m pip install --upgrade platformio
@@ -54,15 +110,17 @@ jobs:
       - name: Build esp32_eth
         run: pio run -e esp32_eth
 
-      - name: Prepare binary
+      - name: Prepare firmware
         shell: bash
         run: |
+          test -f .pio/build/esp32_eth/firmware.bin
           mkdir -p dist
           cp .pio/build/esp32_eth/firmware.bin dist/WLED_0.15.4_ESP32-ETH01_40DDP.bin
-          sha256sum dist/WLED_0.15.4_ESP32-ETH01_40DDP.bin > dist/WLED_0.15.4_ESP32-ETH01_40DDP.bin.sha256
+          sha256sum dist/WLED_0.15.4_ESP32-ETH01_40DDP.bin \
+            > dist/WLED_0.15.4_ESP32-ETH01_40DDP.bin.sha256
 
       - name: Upload firmware artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: WLED_0.15.4_ESP32-ETH01_40DDP
           path: dist/*
