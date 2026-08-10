@@ -123,7 +123,7 @@ Nome build:
 
 ## Changelog
 
-### r1 - 2026-08-10
+### r1 - 10-08-2026
 
 Prima build Tech1977:
 
