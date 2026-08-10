@@ -1,4 +1,4 @@
-name: Build WLED 0.15.4 test DDP Tech1977
+name: Build WLED 0.15.4 test DDP Tech1977 r1
 
 on:
   workflow_dispatch:
@@ -308,7 +308,7 @@ jobs:
           grep -q "char('a' + s - 36)" wled00/xml.cpp
 
           echo "=== Custom About label ==="
-          grep -Fq 'root[F("ver")] = F(".0.15.4 test ddp");' wled00/json.cpp
+          grep -Fq 'root[F("ver")] = F(".0.15.4 test ddp r1");' wled00/json.cpp
           grep -Fq 'root[F("cn")] = F("Tech1977");' wled00/json.cpp
 
           echo "=== Ethernet ==="
