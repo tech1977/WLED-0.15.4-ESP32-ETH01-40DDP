@@ -34,34 +34,86 @@ jobs:
         run: |
           set -euxo pipefail
 
-          # Avoid github.com/pull/4529.patch because that endpoint can return HTTP 429
-          # from GitHub-hosted runners. Fetch the PR Git ref instead.
-          git fetch --no-tags origin \
-            refs/pull/4529/head:refs/remotes/origin/pr4529
-
-          # Make sure the current upstream main history is available so we can
-          # calculate the PR branch merge-base and extract only the PR changes.
+          # Fetch current main and the PR refs.
           git fetch --no-tags origin \
             refs/heads/main:refs/remotes/origin/main
 
-          PR_REF="refs/remotes/origin/pr4529"
-          MAIN_REF="refs/remotes/origin/main"
-          BASE="$(git merge-base "$MAIN_REF" "$PR_REF")"
+          git fetch --no-tags origin \
+            refs/pull/4529/head:refs/remotes/origin/pr4529
 
-          echo "PR 4529 head: $(git rev-parse "$PR_REF")"
-          echo "PR 4529 base: $BASE"
+          # IMPORTANT:
+          # The PR head is already an ancestor of today's main, so using
+          # merge-base(main, PR_HEAD) gives PR_HEAD itself and an empty diff.
+          # Prefer the PR synthetic merge ref, which preserves the target-side
+          # parent needed to reconstruct exactly what PR #4529 introduced.
+          HAVE_MERGE_REF=0
+          if git fetch --no-tags origin \
+              refs/pull/4529/merge:refs/remotes/origin/pr4529-merge; then
+            HAVE_MERGE_REF=1
+          fi
 
-          # Generate a local patch containing only the net changes introduced
-          # by PR 4529, then backport those changes onto WLED v0.15.4.
-          git diff --binary "$BASE" "$PR_REF" > /tmp/wled-pr4529.diff
-          test -s /tmp/wled-pr4529.diff
+          PATCH=/tmp/wled-pr4529.diff
+          : > "$PATCH"
 
-          echo "=== PR 4529 changed files ==="
-          git diff --name-status "$BASE" "$PR_REF"
+          if [ "$HAVE_MERGE_REF" -eq 1 ]; then
+            MERGE_REF=refs/remotes/origin/pr4529-merge
+            PARENT_COUNT="$(git rev-list --parents -n 1 "$MERGE_REF" | awk '{print NF-1}')"
 
-          # Three-way apply is more tolerant of context differences while still
-          # failing safely if the 0.15.4 source is not compatible.
-          git apply --3way /tmp/wled-pr4529.diff
+            echo "PR merge ref: $(git rev-parse "$MERGE_REF")"
+            echo "Merge parent count: $PARENT_COUNT"
+
+            if [ "$PARENT_COUNT" -ge 2 ]; then
+              BASE="$(git rev-parse "$MERGE_REF^1")"
+              echo "PR target-side parent: $BASE"
+
+              # Net changes introduced by the PR merge, including any merge
+              # conflict resolution that GitHub recorded.
+              git diff --binary "$BASE" "$MERGE_REF" > "$PATCH"
+            fi
+          fi
+
+          # Fallback for repositories where the PR merge ref is unavailable:
+          # locate the merged/squashed commit in main by PR number or title.
+          if [ ! -s "$PATCH" ]; then
+            echo "Merge-ref method unavailable/empty; trying main-history fallback."
+
+            PR_COMMIT="$(git log refs/remotes/origin/main \
+              --format='%H' --grep='#4529' -n 1 || true)"
+
+            if [ -z "$PR_COMMIT" ]; then
+              PR_COMMIT="$(git log refs/remotes/origin/main \
+                --format='%H' --regexp-ignore-case \
+                --grep='unlimited.*buses' -n 1 || true)"
+            fi
+
+            if [ -z "$PR_COMMIT" ]; then
+              echo "ERROR: unable to identify PR #4529 merge/squash commit."
+              exit 1
+            fi
+
+            echo "PR commit found in main: $PR_COMMIT"
+            echo "Subject: $(git show -s --format='%s' "$PR_COMMIT")"
+
+            PARENT_COUNT="$(git rev-list --parents -n 1 "$PR_COMMIT" | awk '{print NF-1}')"
+
+            if [ "$PARENT_COUNT" -ge 2 ]; then
+              BASE="$(git rev-parse "$PR_COMMIT^1")"
+            else
+              BASE="$(git rev-parse "$PR_COMMIT^")"
+            fi
+
+            git diff --binary "$BASE" "$PR_COMMIT" > "$PATCH"
+          fi
+
+          test -s "$PATCH"
+
+          echo "=== PR 4529 patch files ==="
+          git apply --stat "$PATCH"
+          git apply --numstat "$PATCH"
+
+          # Apply onto the checked-out v0.15.4 tree.
+          # --3way uses the blob IDs in the generated Git diff when possible.
+          git apply --3way "$PATCH"
 
           echo "=== PR 4529 backport applied to v0.15.4 ==="
           git status --short
@@ -75,13 +127,12 @@ jobs:
 
           # ------------------------------------------------------------
           # 1) 40 segments.
-          # Keep WLED's original effect-data budget ratio:
+          # Keep WLED's stock effect-data ratio:
           # 40 * 1280 = 51200 bytes maximum.
           # ------------------------------------------------------------
           p = Path("wled00/FX.h")
           s = p.read_text(encoding="utf-8")
 
-          # Handle stock 0.15.4 value.
           if re.search(r'(?m)^#define\s+MAX_NUM_SEGMENTS\s+32\s*$', s):
               s = re.sub(
                   r'(?m)^#define\s+MAX_NUM_SEGMENTS\s+32\s*$',
@@ -92,7 +143,6 @@ jobs:
           elif not re.search(r'(?m)^#define\s+MAX_NUM_SEGMENTS\s+40\s*$', s):
               raise SystemExit("MAX_NUM_SEGMENTS 32/40 not found")
 
-          # Restore/use proportional WLED formula.
           if re.search(r'(?m)^#define\s+MAX_SEGMENT_DATA\s+\(40\*1024\)\s*$', s):
               s = re.sub(
                   r'(?m)^#define\s+MAX_SEGMENT_DATA\s+\(40\*1024\)\s*$',
@@ -158,7 +208,7 @@ jobs:
           sed -n '/\[env:esp32_eth\]/,/^\[/p' platformio.ini | head -n 30
           sed -n '/\[env:esp32_eth\]/,/^\[/p' platformio.ini | grep -q -- "-D WLED_ETH_DEFAULT=1"
 
-          echo "=== Custom/backported files ==="
+          echo "=== Backported/custom files ==="
           git status --short
 
       - name: Install PlatformIO
