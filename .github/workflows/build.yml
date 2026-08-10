@@ -1,4 +1,4 @@
-name: Build WLED 0.15.4 ESP32-ETH01 40 DDP 40 Segments
+name: Build WLED 0.15.4 ETH01 - PR4529 - 40 DDP - 40 Segments
 
 on:
   workflow_dispatch:
@@ -13,6 +13,7 @@ jobs:
         with:
           repository: wled/WLED
           ref: v0.15.4
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v6
@@ -25,49 +26,76 @@ jobs:
           node-version: '20'
           package-manager-cache: false
 
-      - name: Patch 40 DDP buses, 40 segments and WT32-ETH01
+      - name: Backport official WLED PR 4529 - Unlimited buses
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          curl -fL --retry 3 \
+            https://github.com/wled/WLED/pull/4529.patch \
+            -o /tmp/wled-pr4529.patch
+
+          test -s /tmp/wled-pr4529.patch
+
+          echo "=== PR 4529 patch summary ==="
+          grep '^Subject:' /tmp/wled-pr4529.patch || true
+
+          # Apply the exact official PR commits onto the v0.15.4 tree.
+          # -3 enables a three-way fallback when surrounding lines changed.
+          git am -3 /tmp/wled-pr4529.patch
+
+          echo "=== Backport applied ==="
+          git --no-pager log --oneline -8
+
+      - name: Patch 40 segments and WT32-ETH01 default
         shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
+          import re
 
-          # 1) Classic ESP32: 19 physical slots + 21 virtual slots = 40 total
-          p = Path("wled00/const.h")
-          s = p.read_text(encoding="utf-8")
-
-          marker = "#define WLED_MAX_BUSSES 19"
-          start = s.find(marker)
-          if start < 0:
-              raise SystemExit("Classic ESP32 WLED_MAX_BUSSES 19 block not found")
-
-          target = "#define WLED_MIN_VIRTUAL_BUSSES 6"
-          pos = s.find(target, start)
-          if pos < 0 or (pos - start) > 800:
-              raise SystemExit("Classic ESP32 WLED_MIN_VIRTUAL_BUSSES 6 not found")
-
-          replacement = "#define WLED_MIN_VIRTUAL_BUSSES 21"
-          s = s[:pos] + replacement + s[pos + len(target):]
-          p.write_text(s, encoding="utf-8")
-
-          # 2) Raise segment limit from 32 to 40.
-          # Keep total segment effect data around original ~40 KiB.
+          # ------------------------------------------------------------
+          # 1) 40 segments.
+          # Keep the original WLED per-segment effect-data ratio:
+          # 40 * 1280 = 51200 bytes maximum effect data.
+          # ------------------------------------------------------------
           p = Path("wled00/FX.h")
           s = p.read_text(encoding="utf-8")
 
-          old_seg = "#define MAX_NUM_SEGMENTS  32"
-          new_seg = "#define MAX_NUM_SEGMENTS  40"
-          if old_seg not in s:
-              raise SystemExit("MAX_NUM_SEGMENTS 32 not found")
-          s = s.replace(old_seg, new_seg, 1)
+          s2, n = re.subn(
+              r'(?m)^#define\s+MAX_NUM_SEGMENTS\s+32\s*$',
+              '#define MAX_NUM_SEGMENTS  40',
+              s,
+              count=1
+          )
+          if n != 1:
+              raise SystemExit("MAX_NUM_SEGMENTS 32 not found exactly once")
+          s = s2
 
-          old_data = "#define MAX_SEGMENT_DATA  (MAX_NUM_SEGMENTS*1280)"
-          new_data = "#define MAX_SEGMENT_DATA  (40*1024)"
-          if old_data not in s:
-              raise SystemExit("MAX_SEGMENT_DATA expression not found")
-          s = s.replace(old_data, new_data, 1)
+          # If the original formula is still present, leave it as a formula.
+          # With MAX_NUM_SEGMENTS=40 this becomes 51200 bytes automatically.
+          if not re.search(r'(?m)^#define\s+MAX_SEGMENT_DATA\s+\(MAX_NUM_SEGMENTS\*1280\)\s*$', s):
+              # Accept an already-customised 40 KiB line from an earlier workflow
+              # and restore the original proportional formula.
+              s2, n = re.subn(
+                  r'(?m)^#define\s+MAX_SEGMENT_DATA\s+\(40\*1024\)\s*$',
+                  '#define MAX_SEGMENT_DATA  (MAX_NUM_SEGMENTS*1280)',
+                  s,
+                  count=1
+              )
+              if n != 1:
+                  raise SystemExit("MAX_SEGMENT_DATA formula not found")
+              s = s2
+
           p.write_text(s, encoding="utf-8")
 
-          # 3) WT32-ETH01 default Ethernet profile (type 1)
+          # ------------------------------------------------------------
+          # 2) WT32-ETH01 as the default Ethernet board.
+          # WLED_ETH_WT32_ETH01 == 1 in WLED.
+          # ------------------------------------------------------------
           p = Path("platformio.ini")
           s = p.read_text(encoding="utf-8")
 
@@ -80,39 +108,43 @@ jobs:
               env_end = len(s)
 
           section = s[env_start:env_end]
-          flag = "-D WLED_USE_ETHERNET"
-          if flag not in section:
-              raise SystemExit("WLED_USE_ETHERNET flag not found in esp32_eth")
 
           if "-D WLED_ETH_DEFAULT=1" not in section:
-              section = section.replace(flag, flag + " -D WLED_ETH_DEFAULT=1", 1)
+              flag = "-D WLED_USE_ETHERNET"
+              if flag not in section:
+                  raise SystemExit("WLED_USE_ETHERNET flag not found in esp32_eth")
+              section = section.replace(
+                  flag,
+                  flag + " -D WLED_ETH_DEFAULT=1",
+                  1
+              )
 
           s = s[:env_start] + section + s[env_end:]
           p.write_text(s, encoding="utf-8")
 
-          print("OK: WLED_MIN_VIRTUAL_BUSSES = 21")
+          print("OK: official PR 4529 backport is present")
           print("OK: MAX_NUM_SEGMENTS = 40")
-          print("OK: MAX_SEGMENT_DATA = 40960 bytes")
+          print("OK: MAX_SEGMENT_DATA = 40 * 1280 = 51200 bytes")
           print("OK: WT32-ETH01 default Ethernet type = 1")
           PY
 
-      - name: Verify patch
+      - name: Verify custom build
         shell: bash
         run: |
-          echo "=== Classic ESP32 bus limits ==="
-          grep -n -A4 -B2 "WLED_MAX_BUSSES 19" wled00/const.h
+          set -euxo pipefail
 
           echo "=== Segment limits ==="
-          grep -n -A3 -B3 "MAX_NUM_SEGMENTS  40" wled00/FX.h
-          grep -n "MAX_SEGMENT_DATA  (40\*1024)" wled00/FX.h
+          grep -n -E "MAX_NUM_SEGMENTS|MAX_SEGMENT_DATA" wled00/FX.h | head -n 10
+          grep -qE '^#define[[:space:]]+MAX_NUM_SEGMENTS[[:space:]]+40[[:space:]]*$' wled00/FX.h
+          grep -qE '^#define[[:space:]]+MAX_SEGMENT_DATA[[:space:]]+\(MAX_NUM_SEGMENTS\*1280\)[[:space:]]*$' wled00/FX.h
 
-          echo "=== esp32_eth ==="
-          sed -n '/\[env:esp32_eth\]/,/^\[/p' platformio.ini | head -n 25
-
-          grep -q "#define WLED_MIN_VIRTUAL_BUSSES 21" wled00/const.h
-          grep -q "#define MAX_NUM_SEGMENTS  40" wled00/FX.h
-          grep -q "#define MAX_SEGMENT_DATA  (40\*1024)" wled00/FX.h
+          echo "=== Ethernet env ==="
+          sed -n '/\[env:esp32_eth\]/,/^\[/p' platformio.ini | head -n 30
           sed -n '/\[env:esp32_eth\]/,/^\[/p' platformio.ini | grep -q -- "-D WLED_ETH_DEFAULT=1"
+
+          echo "=== Files changed by backport/customisation ==="
+          git status --short
+          git diff --stat HEAD || true
 
       - name: Install PlatformIO
         run: python -m pip install --upgrade platformio
@@ -126,14 +158,23 @@ jobs:
       - name: Prepare firmware
         shell: bash
         run: |
+          set -euxo pipefail
           test -f .pio/build/esp32_eth/firmware.bin
+
           mkdir -p dist
-          cp .pio/build/esp32_eth/firmware.bin dist/WLED_0.15.4_ESP32-ETH01_40DDP_40SEG.bin
-          sha256sum dist/WLED_0.15.4_ESP32-ETH01_40DDP_40SEG.bin > dist/WLED_0.15.4_ESP32-ETH01_40DDP_40SEG.bin.sha256
+          cp .pio/build/esp32_eth/firmware.bin \
+            dist/WLED_0.15.4_ESP32-ETH01_PR4529_40DDP_40SEG.bin
+
+          sha256sum \
+            dist/WLED_0.15.4_ESP32-ETH01_PR4529_40DDP_40SEG.bin \
+            > dist/WLED_0.15.4_ESP32-ETH01_PR4529_40DDP_40SEG.bin.sha256
+
+          # Keep the exact PR patch in the artifact for traceability.
+          cp /tmp/wled-pr4529.patch dist/WLED_PR4529_unlimited-buses.patch
 
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v7
         with:
-          name: WLED_0.15.4_ESP32-ETH01_40DDP_40SEG
+          name: WLED_0.15.4_ESP32-ETH01_PR4529_40DDP_40SEG
           path: dist/*
           if-no-files-found: error
