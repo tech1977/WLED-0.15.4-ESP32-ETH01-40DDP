@@ -332,15 +332,15 @@ jobs:
 
           mkdir -p dist
           cp .pio/build/esp32_eth/firmware.bin \
-            dist/WLED_v0.15.4_test_DDP_Tech1977.bin
+            dist/WLED_v0.15.4_test_DDP_Tech1977_r1.bin
 
           sha256sum \
-            dist/WLED_v0.15.4_test_DDP_Tech1977.bin \
-            > dist/WLED_v0.15.4_test_DDP_Tech1977.bin.sha256
+            dist/WLED_v0.15.4_test_DDP_Tech1977_r1.bin \
+            > dist/WLED_v0.15.4_test_DDP_Tech1977_r1.bin.sha256
 
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v7
         with:
-          name: WLED_v0.15.4_test_DDP_Tech1977
+          name: WLED_v0.15.4_test_DDP_Tech1977_r1
           path: dist/*
           if-no-files-found: error
