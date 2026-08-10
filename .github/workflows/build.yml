@@ -1,4 +1,4 @@
-name: Diagnose WLED 0.15.4 backport PR4529
+name: Diagnose WLED 0.15.4 backport PR4529 v2
 
 on:
   workflow_dispatch:
@@ -18,37 +18,83 @@ jobs:
           ref: v0.15.4
           fetch-depth: 0
 
-      - name: Fetch PR 4529 and reconstruct patch
+      - name: Reconstruct official PR 4529 patch
         shell: bash
         run: |
           set -euxo pipefail
 
           git fetch --no-tags origin \
-            refs/pull/4529/head:refs/remotes/origin/pr4529
+            refs/heads/main:refs/remotes/origin/main
 
           git fetch --no-tags origin \
+            refs/pull/4529/head:refs/remotes/origin/pr4529
+
+          PATCH=/tmp/wled-pr4529.diff
+          : > "$PATCH"
+
+          # Old/merged PRs may no longer expose refs/pull/<N>/merge.
+          # Try it, but do not fail if it does not exist.
+          set +e
+          git fetch --no-tags origin \
             refs/pull/4529/merge:refs/remotes/origin/pr4529-merge
+          MERGE_FETCH_RC=$?
+          set -e
 
-          MERGE_REF=refs/remotes/origin/pr4529-merge
-          BASE="$(git rev-parse "$MERGE_REF^1")"
+          if [ "$MERGE_FETCH_RC" -eq 0 ]; then
+            MERGE_REF=refs/remotes/origin/pr4529-merge
+            PARENT_COUNT="$(git rev-list --parents -n 1 "$MERGE_REF" | awk '{print NF-1}')"
 
-          echo "PR head:  $(git rev-parse refs/remotes/origin/pr4529)"
-          echo "PR merge: $(git rev-parse "$MERGE_REF")"
-          echo "PR base:  $BASE"
+            if [ "$PARENT_COUNT" -ge 2 ]; then
+              BASE="$(git rev-parse "$MERGE_REF^1")"
+              git diff --binary "$BASE" "$MERGE_REF" > "$PATCH"
+            fi
+          fi
 
-          git diff --binary "$BASE" "$MERGE_REF" > /tmp/wled-pr4529.diff
-          test -s /tmp/wled-pr4529.diff
+          # Fallback: find the merged/squashed PR commit in current main.
+          if [ ! -s "$PATCH" ]; then
+            PR_COMMIT="$(git log refs/remotes/origin/main \
+              --format='%H' --grep='#4529' -n 1 || true)"
+
+            if [ -z "$PR_COMMIT" ]; then
+              PR_COMMIT="$(git log refs/remotes/origin/main \
+                --format='%H' --regexp-ignore-case \
+                --grep='unlimited.*buses' -n 1 || true)"
+            fi
+
+            if [ -z "$PR_COMMIT" ]; then
+              echo "ERROR: unable to identify PR #4529 merge/squash commit."
+              exit 1
+            fi
+
+            echo "PR 4529 commit in main: $PR_COMMIT"
+            echo "Subject: $(git show -s --format='%s' "$PR_COMMIT")"
+
+            PARENT_COUNT="$(git rev-list --parents -n 1 "$PR_COMMIT" | awk '{print NF-1}')"
+
+            if [ "$PARENT_COUNT" -ge 2 ]; then
+              BASE="$(git rev-parse "$PR_COMMIT^1")"
+            else
+              BASE="$(git rev-parse "$PR_COMMIT^")"
+            fi
+
+            git diff --binary "$BASE" "$PR_COMMIT" > "$PATCH"
+          fi
+
+          test -s "$PATCH"
 
           echo "=== PR 4529 patch stat ==="
-          git apply --stat /tmp/wled-pr4529.diff
+          git apply --stat "$PATCH"
 
-      - name: Apply what can be applied and collect rejects
+          mkdir -p /tmp/diag
+          cp "$PATCH" /tmp/diag/WLED_PR4529_full.diff
+
+      - name: Apply compatible hunks and collect rejects
         shell: bash
         run: |
           set +e
 
-          # --reject applies compatible hunks and writes only incompatible
-          # hunks to *.rej files. We intentionally continue after failure.
+          # Apply everything that cleanly matches v0.15.4 and write only
+          # incompatible hunks to *.rej files.
           git apply --reject --whitespace=fix /tmp/wled-pr4529.diff
           APPLY_RC=$?
 
@@ -57,16 +103,11 @@ jobs:
           mkdir -p /tmp/diag/rejects
           mkdir -p /tmp/diag/sources
 
-          cp /tmp/wled-pr4529.diff /tmp/diag/WLED_PR4529_full.diff
-
-          # Collect all reject files.
           find wled00 -type f -name '*.rej' -print | sort | while read f; do
             mkdir -p "/tmp/diag/rejects/$(dirname "$f")"
             cp "$f" "/tmp/diag/rejects/$f"
           done
 
-          # Collect the affected v0.15.4 files AFTER non-conflicting hunks
-          # have been applied, plus .orig where generated.
           for f in \
             wled00/FX_fcn.cpp \
             wled00/bus_manager.cpp \
@@ -89,6 +130,9 @@ jobs:
           done
 
           {
+            echo "=== APPLY RETURN CODE ==="
+            echo "$APPLY_RC"
+            echo
             echo "=== STATUS ==="
             git status --short
             echo
@@ -104,12 +148,12 @@ jobs:
             done < <(find wled00 -type f -name '*.rej' -print | sort)
           } | tee /tmp/diag/rejects.txt
 
-          # Always succeed so the diagnostic artifact is uploaded.
+          # Diagnostic run must continue so the artifact is always uploaded.
           exit 0
 
       - name: Upload diagnostic artifact
         uses: actions/upload-artifact@v7
         with:
-          name: PR4529_v0154_backport_diagnostics
+          name: PR4529_v0154_backport_diagnostics_v2
           path: /tmp/diag/**
           if-no-files-found: error
