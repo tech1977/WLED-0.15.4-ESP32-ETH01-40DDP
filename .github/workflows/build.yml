@@ -3,6 +3,9 @@ name: Build WLED 0.15.4 ETH01 - PR4529 - 40 DDP - 40 Segments
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -31,24 +34,37 @@ jobs:
         run: |
           set -euxo pipefail
 
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Avoid github.com/pull/4529.patch because that endpoint can return HTTP 429
+          # from GitHub-hosted runners. Fetch the PR Git ref instead.
+          git fetch --no-tags origin \
+            refs/pull/4529/head:refs/remotes/origin/pr4529
 
-          curl -fL --retry 3 \
-            https://github.com/wled/WLED/pull/4529.patch \
-            -o /tmp/wled-pr4529.patch
+          # Make sure the current upstream main history is available so we can
+          # calculate the PR branch merge-base and extract only the PR changes.
+          git fetch --no-tags origin \
+            refs/heads/main:refs/remotes/origin/main
 
-          test -s /tmp/wled-pr4529.patch
+          PR_REF="refs/remotes/origin/pr4529"
+          MAIN_REF="refs/remotes/origin/main"
+          BASE="$(git merge-base "$MAIN_REF" "$PR_REF")"
 
-          echo "=== PR 4529 patch summary ==="
-          grep '^Subject:' /tmp/wled-pr4529.patch || true
+          echo "PR 4529 head: $(git rev-parse "$PR_REF")"
+          echo "PR 4529 base: $BASE"
 
-          # Apply the exact official PR commits onto the v0.15.4 tree.
-          # -3 enables a three-way fallback when surrounding lines changed.
-          git am -3 /tmp/wled-pr4529.patch
+          # Generate a local patch containing only the net changes introduced
+          # by PR 4529, then backport those changes onto WLED v0.15.4.
+          git diff --binary "$BASE" "$PR_REF" > /tmp/wled-pr4529.diff
+          test -s /tmp/wled-pr4529.diff
 
-          echo "=== Backport applied ==="
-          git --no-pager log --oneline -8
+          echo "=== PR 4529 changed files ==="
+          git diff --name-status "$BASE" "$PR_REF"
+
+          # Three-way apply is more tolerant of context differences while still
+          # failing safely if the 0.15.4 source is not compatible.
+          git apply --3way /tmp/wled-pr4529.diff
+
+          echo "=== PR 4529 backport applied to v0.15.4 ==="
+          git status --short
 
       - name: Patch 40 segments and WT32-ETH01 default
         shell: bash
@@ -59,42 +75,42 @@ jobs:
 
           # ------------------------------------------------------------
           # 1) 40 segments.
-          # Keep the original WLED per-segment effect-data ratio:
-          # 40 * 1280 = 51200 bytes maximum effect data.
+          # Keep WLED's original effect-data budget ratio:
+          # 40 * 1280 = 51200 bytes maximum.
           # ------------------------------------------------------------
           p = Path("wled00/FX.h")
           s = p.read_text(encoding="utf-8")
 
-          s2, n = re.subn(
-              r'(?m)^#define\s+MAX_NUM_SEGMENTS\s+32\s*$',
-              '#define MAX_NUM_SEGMENTS  40',
-              s,
-              count=1
-          )
-          if n != 1:
-              raise SystemExit("MAX_NUM_SEGMENTS 32 not found exactly once")
-          s = s2
+          # Handle stock 0.15.4 value.
+          if re.search(r'(?m)^#define\s+MAX_NUM_SEGMENTS\s+32\s*$', s):
+              s = re.sub(
+                  r'(?m)^#define\s+MAX_NUM_SEGMENTS\s+32\s*$',
+                  '#define MAX_NUM_SEGMENTS  40',
+                  s,
+                  count=1
+              )
+          elif not re.search(r'(?m)^#define\s+MAX_NUM_SEGMENTS\s+40\s*$', s):
+              raise SystemExit("MAX_NUM_SEGMENTS 32/40 not found")
 
-          # If the original formula is still present, leave it as a formula.
-          # With MAX_NUM_SEGMENTS=40 this becomes 51200 bytes automatically.
-          if not re.search(r'(?m)^#define\s+MAX_SEGMENT_DATA\s+\(MAX_NUM_SEGMENTS\*1280\)\s*$', s):
-              # Accept an already-customised 40 KiB line from an earlier workflow
-              # and restore the original proportional formula.
-              s2, n = re.subn(
+          # Restore/use proportional WLED formula.
+          if re.search(r'(?m)^#define\s+MAX_SEGMENT_DATA\s+\(40\*1024\)\s*$', s):
+              s = re.sub(
                   r'(?m)^#define\s+MAX_SEGMENT_DATA\s+\(40\*1024\)\s*$',
                   '#define MAX_SEGMENT_DATA  (MAX_NUM_SEGMENTS*1280)',
                   s,
                   count=1
               )
-              if n != 1:
-                  raise SystemExit("MAX_SEGMENT_DATA formula not found")
-              s = s2
+          elif not re.search(
+              r'(?m)^#define\s+MAX_SEGMENT_DATA\s+\(MAX_NUM_SEGMENTS\*1280\)\s*$',
+              s
+          ):
+              raise SystemExit("MAX_SEGMENT_DATA formula not found")
 
           p.write_text(s, encoding="utf-8")
 
           # ------------------------------------------------------------
-          # 2) WT32-ETH01 as the default Ethernet board.
-          # WLED_ETH_WT32_ETH01 == 1 in WLED.
+          # 2) WT32-ETH01 as default Ethernet profile.
+          # WLED_ETH_WT32_ETH01 == 1.
           # ------------------------------------------------------------
           p = Path("platformio.ini")
           s = p.read_text(encoding="utf-8")
@@ -122,9 +138,9 @@ jobs:
           s = s[:env_start] + section + s[env_end:]
           p.write_text(s, encoding="utf-8")
 
-          print("OK: official PR 4529 backport is present")
+          print("OK: PR 4529 backport present")
           print("OK: MAX_NUM_SEGMENTS = 40")
-          print("OK: MAX_SEGMENT_DATA = 40 * 1280 = 51200 bytes")
+          print("OK: MAX_SEGMENT_DATA = 51200 bytes max")
           print("OK: WT32-ETH01 default Ethernet type = 1")
           PY
 
@@ -142,9 +158,8 @@ jobs:
           sed -n '/\[env:esp32_eth\]/,/^\[/p' platformio.ini | head -n 30
           sed -n '/\[env:esp32_eth\]/,/^\[/p' platformio.ini | grep -q -- "-D WLED_ETH_DEFAULT=1"
 
-          echo "=== Files changed by backport/customisation ==="
+          echo "=== Custom/backported files ==="
           git status --short
-          git diff --stat HEAD || true
 
       - name: Install PlatformIO
         run: python -m pip install --upgrade platformio
@@ -169,8 +184,8 @@ jobs:
             dist/WLED_0.15.4_ESP32-ETH01_PR4529_40DDP_40SEG.bin \
             > dist/WLED_0.15.4_ESP32-ETH01_PR4529_40DDP_40SEG.bin.sha256
 
-          # Keep the exact PR patch in the artifact for traceability.
-          cp /tmp/wled-pr4529.patch dist/WLED_PR4529_unlimited-buses.patch
+          cp /tmp/wled-pr4529.diff \
+            dist/WLED_PR4529_unlimited-buses_backport.diff
 
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v7
