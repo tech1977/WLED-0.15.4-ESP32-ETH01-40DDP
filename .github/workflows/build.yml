@@ -1,4 +1,4 @@
-name: Build WLED 0.15.4 ESP32-ETH01 40 DDP 40 SEG Persistent
+name: Build WLED 0.15.4 ESP32-ETH01 40 DDP 40 SEG Persistent v2
 
 on:
   workflow_dispatch:
@@ -62,19 +62,17 @@ jobs:
           p = "wled00/FX.h"
           s = read(p)
 
-          s, n = re.subn(
-              r'(?m)^#define\s+MAX_NUM_SEGMENTS\s+32\s*$',
-              '#define MAX_NUM_SEGMENTS  40',
-              s,
-              count=1
-          )
-          if n != 1:
-              raise SystemExit("MAX_NUM_SEGMENTS 32 not found exactly once")
+          # Match the stock token as a substring, not the whole line:
+          # some WLED 0.15.x snapshots keep an inline comment on this define.
+          old_seg = "#define MAX_NUM_SEGMENTS  32"
+          if old_seg not in s:
+              raise SystemExit("MAX_NUM_SEGMENTS 32 token not found")
+          s = s.replace(old_seg, "#define MAX_NUM_SEGMENTS  40", 1)
 
-          if not re.search(
-              r'(?m)^#define\s+MAX_SEGMENT_DATA\s+\(MAX_NUM_SEGMENTS\*1280\)\s*$',
-              s
-          ):
+          # Keep WLED's original proportional formula. With 40 segments it
+          # evaluates to 51200 bytes maximum effect data.
+          data_formula = "#define MAX_SEGMENT_DATA  (MAX_NUM_SEGMENTS*1280)"
+          if data_formula not in s:
               raise SystemExit("Original MAX_SEGMENT_DATA formula not found")
 
           write(p, s)
@@ -263,8 +261,8 @@ jobs:
 
           echo "=== Segment limits ==="
           grep -n -E "MAX_NUM_SEGMENTS|MAX_SEGMENT_DATA" wled00/FX.h | head -n 10
-          grep -qE '^#define[[:space:]]+MAX_NUM_SEGMENTS[[:space:]]+40[[:space:]]*$' wled00/FX.h
-          grep -qE '^#define[[:space:]]+MAX_SEGMENT_DATA[[:space:]]+\(MAX_NUM_SEGMENTS\*1280\)[[:space:]]*$' wled00/FX.h
+          grep -q '#define MAX_NUM_SEGMENTS  40' wled00/FX.h
+          grep -q '#define MAX_SEGMENT_DATA  (MAX_NUM_SEGMENTS*1280)' wled00/FX.h
 
           echo "=== Config virtual-bus loader ==="
           grep -n -A45 "JsonArray ins = hw_led" wled00/cfg.cpp | head -n 60
@@ -300,15 +298,15 @@ jobs:
 
           mkdir -p dist
           cp .pio/build/esp32_eth/firmware.bin \
-            dist/WLED_0.15.4_ESP32-ETH01_40DDP_40SEG_PERSIST.bin
+            dist/WLED_0.15.4_ESP32-ETH01_40DDP_40SEG_PERSIST_v2.bin
 
           sha256sum \
-            dist/WLED_0.15.4_ESP32-ETH01_40DDP_40SEG_PERSIST.bin \
-            > dist/WLED_0.15.4_ESP32-ETH01_40DDP_40SEG_PERSIST.bin.sha256
+            dist/WLED_0.15.4_ESP32-ETH01_40DDP_40SEG_PERSIST_v2.bin \
+            > dist/WLED_0.15.4_ESP32-ETH01_40DDP_40SEG_PERSIST_v2.bin.sha256
 
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v7
         with:
-          name: WLED_0.15.4_ESP32-ETH01_40DDP_40SEG_PERSIST
+          name: WLED_0.15.4_ESP32-ETH01_40DDP_40SEG_PERSIST_v2
           path: dist/*
           if-no-files-found: error
