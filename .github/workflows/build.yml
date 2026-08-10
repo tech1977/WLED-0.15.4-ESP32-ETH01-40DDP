@@ -260,7 +260,7 @@ jobs:
 
           s = s.replace(
               old_ver,
-              'root[F("ver")] = F(".0.15.4 test ddp");',
+              'root[F("ver")] = F(".0.15.4 test ddp r1");',
               1
           )
           s = s.replace(
